@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+numpy==1.26.4
+opencv-python==4.9.0.80
+insightface==0.7.3
+onnxruntime==1.17.3

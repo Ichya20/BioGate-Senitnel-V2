@@ -7,3 +7,8 @@ coverage/
 .env*
 !.env.example
 public/face-data/
+backend-face/.venv/
+backend-face/__pycache__/
+backend-face/*.pyc
+backend-face/.pytest_cache/
+backend-face/face_db.json

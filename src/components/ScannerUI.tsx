@@ -13,7 +13,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Mic, MicOff, CheckCircle, AlertTriangle, Lock, Fingerprint, ShieldAlert, UserX, Shield } from 'lucide-react';
 import { AuthResponse, User } from '../types';
-import * as tmImage from '@teachablemachine/image';
+import { verifyFaceFromBlob } from "../services/faceApi";
 import { useNavigate } from 'react-router-dom';
 
 declare global {
@@ -35,7 +35,7 @@ const ALL_USERS = [
   { id: 1, name: 'Ichya Ulumiddiin' },
   { id: 2, name: 'Abid Fadhilah Mustofa' },
   { id: 3, name: 'Iklil Bahy Sabaiki' },
-  { id: 4, name: 'Nathan Domuni Pasaribu' },
+  { id: 4, name: 'Nathan Domuli Pasaribu' },
   { id: 5, name: 'Nashir Khoirul Huda' },
   { id: 6, name: 'Arif Kurniawan' },
 ];
@@ -106,6 +106,41 @@ function playDuressAlarm(durationMs = 5000) {
   }
 }
 
+function captureFrameFromVideo(video: HTMLVideoElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    if (!video.videoWidth || !video.videoHeight) {
+      reject(new Error("Video belum siap."));
+      return;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      reject(new Error("Canvas context gagal dibuat."));
+      return;
+    }
+
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error("Gagal capture frame."));
+          return;
+        }
+
+        resolve(blob);
+      },
+      "image/jpeg",
+      0.9
+    );
+  });
+}
+
 export default function ScannerUI() {
   const navigate = useNavigate();
   const [loadingProgress, setLoadingProgress] = useState(0);
@@ -128,10 +163,10 @@ export default function ScannerUI() {
   const [phraseVisible, setPhraseVisible] = useState(false);
   const [voiceBars, setVoiceBars]       = useState([0.4, 0.7, 1, 0.6, 0.8, 0.7, 0.4]);
 
-  // Teachable Machine States
-  const [model, setModel] = useState<tmImage.CustomMobileNet | null>(null);
-  const [isModelLoading, setIsModelLoading] = useState(true);
-  const [hasStarted, setHasStarted] = useState(false);
+  // Face API States
+const [isModelLoading, setIsModelLoading] = useState(true);
+const [hasStarted, setHasStarted] = useState(false);
+const isVerifyingRef = useRef(false);
 
   const videoRef        = useRef<HTMLVideoElement>(null);
   const recognitionRef  = useRef<any>(null);
@@ -183,23 +218,26 @@ export default function ScannerUI() {
     fetch('/api/users').then(r => r.json()).then(setUsers).catch(() => setUsers(ALL_USERS));
   }, []);
 
-  // ── Load Teachable Machine Model ─────────────────────────────────────────
-  useEffect(() => {
-    const loadModel = async () => {
-      try {
-        const URL = "/my_model/";
-        const modelURL = URL + "model.json";
-        const metadataURL = URL + "metadata.json";
-        const loadedModel = await tmImage.load(modelURL, metadataURL);
-        setModel(loadedModel);
-        setIsModelLoading(false);
-        console.log("Teachable Machine Model Loaded Successfully!");
-      } catch (error) {
-        console.error("Gagal memuat model. Pastikan file ada di folder public/my_model/", error);
+  // ── Check Face API ───────────────────────────────────────────────────────
+useEffect(() => {
+  const checkFaceApi = async () => {
+    try {
+      const response = await fetch("http://127.0.0.1:8000/api/health");
+
+      if (!response.ok) {
+        throw new Error("Face API not ready");
       }
-    };
-    loadModel();
-  }, []);
+
+      setIsModelLoading(false);
+      console.log("BioGate Face API connected.");
+    } catch (error) {
+      console.error("Gagal konek ke BioGate Face API:", error);
+      setIsModelLoading(true);
+    }
+  };
+
+  checkFaceApi();
+}, []);
 
   // ── Speech recognition ───────────────────────────────────────────────────
   const selectedUserRef  = useRef<User | null>(null);
@@ -400,111 +438,6 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
 
   useEffect(() => { verifyMFARef.current = verifyMFA; }, [verifyMFA]);
 
-  // ── Real-time Face Scanning (Teachable Machine) ──────────────────────────
-  const predictWebcam = useCallback(async () => {
-    if (!model || !videoRef.current || phase !== 'scanning') return;
-
-    try {
-      // AI memprediksi frame kamera saat ini
-      const prediction = await model.predict(videoRef.current);
-      
-      // Mencari hasil dengan kemungkinan (probability) paling tinggi
-      const topResult = prediction.reduce((prev, current) => 
-        (prev.probability > current.probability) ? prev : current
-      );
-
-      const probPercentage = parseFloat((topResult.probability * 100).toFixed(1));
-      setConfidence(probPercentage);
-      setVectors(Math.floor(Math.random() * 400 + 800)); // Animasi visual
-
-      // Jika yakin lebih dari 85%
-      if (topResult.probability > 0.85) {
-        
-        if (topResult.className.toLowerCase() === "unknown" || topResult.className.toLowerCase() === "tidak dikenal") {
-           // Wajah tidak ada di database (Unknown Face)
-           setIsUnknown(true);
-           setPhase('face_denied');
-           speak('Access Denied. Unrecognized face detected.');
- 
-           const newLog: LogEntry = {
-             time: getTimeString(),
-             status: 'DENIED',
-             user: 'UNRECOGNIZED_FACE_ID',
-           };
-           setLogs(prev => [newLog, ...prev].slice(0, 12));
- 
-           // Restart otomatis setelah 4 detik
-           setTimeout(() => startAutoScan(), 4000);
-           return; // Hentikan loop
-
-        } else {
-          // Wajah Dikenali
-          const identifiedName = topResult.className;
-      const displayUsers = users.length > 0 ? users : ALL_USERS;
-
-      const normalizeName = (name: string) =>
-        name
-          .toLowerCase()
-          .replace(/[^a-z\s]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-      const normalizedIdentifiedName = normalizeName(identifiedName);
-
-      // Cocokkan nama class dari TM dengan data ALL_USERS tanpa fallback ke user pertama
-        const userMatch = displayUsers.find((u) => {
-        const normalizedUserName = normalizeName(u.name);
-
-        return (
-          normalizedUserName === normalizedIdentifiedName ||
-          normalizedUserName.includes(normalizedIdentifiedName) ||
-          normalizedIdentifiedName.includes(normalizedUserName)
-        );
-      });
-
-      if (!userMatch) {
-        setIsUnknown(true);
-        setSelectedUser(null);
-        setPhase('face_denied');
-        speak('Access Denied. Identity mismatch detected.');
-        return;
-      }
-
-      setSelectedUser(userMatch);
-      setScanningIndex(displayUsers.findIndex(u => u.id === userMatch.id));
-      setPhase('face_found');
-
-      speak(`Face recognized as ${userMatch.name}. Please provide voice authentication.`);
-
-      // Lanjut ke verifikasi suara
-      setTimeout(() => {
-        setPhase('voice');
-        setPhraseVisible(false);
-        setTimeout(() => setPhraseVisible(true), 700);
-      }, 1800);
-
-      return; // Hentikan loop karena sudah ketemu // Hentikan loop karena sudah ketemu
-        }
-      }
-
-      // Jika belum ada yang mencapai 85%, lanjutkan proses scanning
-      requestRef.current = requestAnimationFrame(predictWebcam);
-      
-    } catch (e) {
-      requestRef.current = requestAnimationFrame(predictWebcam);
-    }
-  }, [model, phase, users, speak]);
-
-  // Trigger loop scanning saat berada di fase 'scanning'
-  useEffect(() => {
-    if (phase === 'scanning' && !isModelLoading) {
-      requestRef.current = requestAnimationFrame(predictWebcam);
-    }
-    return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
-    };
-  }, [phase, isModelLoading, predictWebcam]);
-
   // Fungsi Reset / Restart manual
   const startAutoScan = useCallback(() => {
     setPhase('scanning');
@@ -518,6 +451,146 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
     setIsDuress(false);
     setPhraseVisible(false);
   }, []);
+
+// ── Real-time Face Scanning via BioGate Face API ─────────────────────────
+const predictWebcam = useCallback(async () => {
+  if (!videoRef.current || phase !== "scanning" || isVerifyingRef.current) return;
+
+  const video = videoRef.current;
+
+  if (!video.videoWidth || !video.videoHeight) {
+    requestRef.current = requestAnimationFrame(predictWebcam);
+    return;
+  }
+
+  try {
+    isVerifyingRef.current = true;
+
+    const frameBlob = await captureFrameFromVideo(video);
+    const result = await verifyFaceFromBlob(frameBlob);
+
+    setVectors(Math.floor(Math.random() * 400 + 800));
+
+    if (typeof result.confidence === "number") {
+      setConfidence(result.confidence);
+    }
+
+    // Kalau kamera belum menangkap wajah, jangan langsung denied.
+    // Tetap scanning.
+    if (
+      result.status === "ACCESS_DENIED" &&
+      result.reason &&
+      result.reason.toLowerCase().includes("tidak ada wajah")
+    ) {
+      isVerifyingRef.current = false;
+      window.setTimeout(() => {
+        requestRef.current = requestAnimationFrame(predictWebcam);
+      }, 800);
+      return;
+    }
+
+    // Kalau wajah cocok dengan database
+    if (result.status === "MATCH" && result.user) {
+      const identifiedName = result.user.name;
+      const displayUsers = users.length > 0 ? users : ALL_USERS;
+
+      const normalizeName = (name: string) =>
+        name
+          .toLowerCase()
+          .replace(/[^a-z\s]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const normalizedIdentifiedName = normalizeName(identifiedName);
+
+      const userMatch = displayUsers.find((u) => {
+        const normalizedUserName = normalizeName(u.name);
+
+        return (
+          normalizedUserName === normalizedIdentifiedName ||
+          normalizedUserName.includes(normalizedIdentifiedName) ||
+          normalizedIdentifiedName.includes(normalizedUserName)
+        );
+      });
+
+      const finalUser: User =
+        userMatch ??
+        ({
+          id: displayUsers.length + 1,
+          name: identifiedName,
+        } as User);
+
+      setSelectedUser(finalUser);
+      setScanningIndex(displayUsers.findIndex((u) => u.id === finalUser.id));
+      setPhase("face_found");
+
+      speak(`Face recognized as ${finalUser.name}. Please provide voice authentication.`);
+
+      setTimeout(() => {
+        setPhase("voice");
+        setPhraseVisible(false);
+        setTimeout(() => setPhraseVisible(true), 700);
+      }, 1800);
+
+      isVerifyingRef.current = false;
+      return;
+    }
+
+    // Kalau wajah tidak ada di database
+    if (result.status === "ACCESS_DENIED") {
+      setIsUnknown(true);
+      setSelectedUser(null);
+      setIsDuress(true);
+      setShowDuressPopup(true);
+      setPhase("face_denied");
+
+      speak("Access Denied. Unrecognized face detected. Duress protocol activated.");
+      playDuressAlarm(5000);
+
+      const newLog: LogEntry = {
+        time: getTimeString(),
+        status: "DENIED",
+        user: "UNRECOGNIZED_FACE_ID",
+      };
+
+      setLogs((prev) => [newLog, ...prev].slice(0, 12));
+
+      window.setTimeout(() => {
+        setShowDuressPopup(false);
+        setIsDuress(false);
+        startAutoScan();
+      }, 5000);
+
+      isVerifyingRef.current = false;
+      return;
+    }
+
+    isVerifyingRef.current = false;
+
+    window.setTimeout(() => {
+      requestRef.current = requestAnimationFrame(predictWebcam);
+    }, 900);
+  } catch (error) {
+    console.error("Face verification error:", error);
+
+    isVerifyingRef.current = false;
+
+    window.setTimeout(() => {
+      requestRef.current = requestAnimationFrame(predictWebcam);
+    }, 1200);
+  }
+}, [phase, users, startAutoScan]);
+
+// Trigger loop scanning saat berada di fase 'scanning'
+useEffect(() => {
+  if (hasStarted && phase === "scanning" && !isModelLoading) {
+    requestRef.current = requestAnimationFrame(predictWebcam);
+  }
+
+  return () => {
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+  };
+}, [hasStarted, phase, isModelLoading, predictWebcam]);
 
   // ── Voice bar animation ──────────────────────────────────────────────────
   useEffect(() => {
