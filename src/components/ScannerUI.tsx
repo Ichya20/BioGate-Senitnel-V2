@@ -536,7 +536,6 @@ const predictWebcam = useCallback(async () => {
       return;
     }
 
-    // Kalau wajah tidak ada di database
     if (result.status === "ACCESS_DENIED") {
       setIsUnknown(true);
       setSelectedUser(null);
@@ -556,9 +555,33 @@ const predictWebcam = useCallback(async () => {
       setLogs((prev) => [newLog, ...prev].slice(0, 12));
 
       window.setTimeout(() => {
-        setShowDuressPopup(false);
+        recognitionRef.current?.stop();
+
+        if (requestRef.current) {
+          cancelAnimationFrame(requestRef.current);
+        }
+
+        setHasStarted(false);
+        setPhase("scanning");
+        setConfidence(0);
+        setVectors(0);
+        setScanningIndex(0);
+        setSelectedUser(null);
+        setIsUnknown(false);
+        setTranscript("");
+        setAuthResult(null);
         setIsDuress(false);
-        startAutoScan();
+        setShowDuressPopup(false);
+        setPhraseVisible(false);
+        setIsListening(false);
+        setCameraError(false);
+
+        sessionStorage.removeItem("biogate_auth");
+        sessionStorage.removeItem("biogate_agent");
+        sessionStorage.removeItem("biogate_role");
+        sessionStorage.removeItem("biogate_duress");
+
+        window.history.replaceState(null, "", "/");
       }, 5000);
 
       isVerifyingRef.current = false;
