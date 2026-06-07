@@ -7,7 +7,11 @@ import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from insightface.app import FaceAnalysis
-
+import tempfile
+import os
+import subprocess
+import imageio_ffmpeg
+from verify_voice import verify_voice
 
 api = FastAPI(title="BioGate Sentinel Face API")
 
@@ -295,3 +299,69 @@ async def verify_face(file: UploadFile = File(...)):
         "confidence": round(best_score * 100, 2),
         "user": None,
     }
+
+@api.post("/api/voice/verify")
+async def verify_voice_api(
+    expected_user: str = Form(...),
+    file: UploadFile = File(...)
+):
+    input_path = None
+    wav_path = None
+
+    try:
+        suffix = Path(file.filename).suffix or ".webm"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_input:
+            content = await file.read()
+            temp_input.write(content)
+            input_path = temp_input.name
+
+        if os.path.getsize(input_path) == 0:
+            raise ValueError("Uploaded audio is empty.")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
+            wav_path = temp_wav.name
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+        command = [
+            ffmpeg_exe,
+            "-y",
+            "-i", input_path,
+            "-ac", "1",
+            "-ar", "16000",
+            wav_path
+        ]
+
+        process = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if process.returncode != 0:
+            raise RuntimeError(f"FFmpeg conversion failed: {process.stderr[-800:]}")
+
+        result = verify_voice(
+            audio_path=wav_path,
+            expected_user=expected_user,
+            threshold=0.65
+        )
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "FAILED",
+            "reason": repr(e),
+            "score": 0.0,
+            "match": False
+        }
+
+    finally:
+        if input_path and os.path.exists(input_path):
+            os.remove(input_path)
+
+        if wav_path and os.path.exists(wav_path):
+            os.remove(wav_path)

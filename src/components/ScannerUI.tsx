@@ -15,6 +15,7 @@ import { Mic, MicOff, CheckCircle, AlertTriangle, Lock, Fingerprint, ShieldAlert
 import { AuthResponse, User } from '../types';
 import { verifyFaceFromBlob } from "../services/faceApi";
 import { useNavigate } from 'react-router-dom';
+import { verifyVoiceFromBlob } from "../services/voiceApi";
 
 declare global {
   interface Window {
@@ -152,7 +153,9 @@ export default function ScannerUI() {
   const [confidence, setConfidence]     = useState(0);
   const [vectors, setVectors]           = useState(0);
   const [isListening, setIsListening]   = useState(false);
+  const [isVoiceVerifying, setIsVoiceVerifying] = useState(false);
   const [transcript, setTranscript]     = useState('');
+  const [audioBlob, setAudioBlob]       = useState<Blob | null>(null);
   const [authResult, setAuthResult]     = useState<AuthResponse | null>(null);
   const [isDuress, setIsDuress]         = useState(false);
   const [showDuressPopup, setShowDuressPopup] = useState(false);
@@ -168,10 +171,13 @@ const [isModelLoading, setIsModelLoading] = useState(true);
 const [hasStarted, setHasStarted] = useState(false);
 const isVerifyingRef = useRef(false);
 
-  const videoRef        = useRef<HTMLVideoElement>(null);
-  const recognitionRef  = useRef<any>(null);
-  const barIntervalRef  = useRef<any>(null);
-  const requestRef      = useRef<number>(0);
+const videoRef          = useRef<HTMLVideoElement>(null);
+const recognitionRef    = useRef<any>(null);
+const mediaRecorderRef  = useRef<MediaRecorder | null>(null);
+const audioChunksRef    = useRef<Blob[]>([]);
+const audioBlobRef      = useRef<Blob | null>(null);
+const barIntervalRef    = useRef<any>(null);
+const requestRef        = useRef<number>(0);
 
   // ── Real-time clock ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -239,6 +245,58 @@ useEffect(() => {
   checkFaceApi();
 }, []);
 
+    const startVoiceRecording = async () => {
+      try {
+        setAudioBlob(null);
+        audioBlobRef.current = null;
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        audioChunksRef.current = [];
+
+        const recorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+
+        recorder.start();
+      } catch (error) {
+        console.error('Voice recording failed:', error);
+        setAudioBlob(null);
+        audioBlobRef.current = null;
+      }
+    };
+
+  const stopVoiceRecording = (): Promise<Blob | null> => {
+      return new Promise((resolve) => {
+        const recorder = mediaRecorderRef.current;
+
+        if (!recorder || recorder.state === 'inactive') {
+          resolve(audioBlobRef.current);
+          return;
+        }
+
+        recorder.onstop = () => {
+          const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+
+          audioBlobRef.current = blob;
+          setAudioBlob(blob);
+
+          const stream = recorder.stream;
+          stream.getTracks().forEach(track => track.stop());
+
+          resolve(blob);
+        };
+
+        recorder.requestData();
+        recorder.stop();
+      });
+    };
+
   // ── Speech recognition ───────────────────────────────────────────────────
   const selectedUserRef  = useRef<User | null>(null);
   const verifyMFARef     = useRef<(phrase: string) => void>(() => {});
@@ -250,14 +308,32 @@ useEffect(() => {
     const rec = new SR();
     rec.continuous = false;
     rec.lang = 'id-ID';
-    rec.onresult = (e: any) => {
+    rec.onresult = async (e: any) => {
       const text = e.results[0][0].transcript;
       setTranscript(text);
       setIsListening(false);
+      setIsVoiceVerifying(false);
+
+      const blob = await stopVoiceRecording();
+
+      if (blob) {
+        audioBlobRef.current = blob;
+        setAudioBlob(blob);
+      }
+
       verifyMFARef.current(text);
     };
-    rec.onerror = () => setIsListening(false);
-    rec.onend   = () => setIsListening(false);
+
+    rec.onerror = () => {
+      setIsListening(false);
+      setIsVoiceVerifying(false);
+      stopVoiceRecording();
+    };
+
+    rec.onend = () => {
+      setIsListening(false);
+    };
+
     recognitionRef.current = rec;
   }, []);
 
@@ -317,6 +393,7 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
     setShowDuressPopup(true);
     setIsListening(false);
     setPhase('result');
+    setIsVoiceVerifying(false);
 
     recognitionRef.current?.stop();
 
@@ -352,6 +429,7 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
       setShowDuressPopup(false);
       setPhraseVisible(false);
       setIsListening(false);
+      setIsVoiceVerifying(false);
 
       window.history.replaceState(null, '', '/');
     }, 5000);
@@ -359,47 +437,89 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
     return;
   }
 
-  // NORMAL: voice cocok, masuk vault
-  if (isMatch) {
+// NORMAL: voice cocok, masuk vault
+if (isMatch) {
+  const recordedAudioBlob = audioBlobRef.current || audioBlob;
+  if (!recordedAudioBlob) {
     setAuthResult({
-      status: 'success',
-      user: {
-        name: user.name,
-        role: assignedRole,
-      },
+      status: 'error',
+      message: 'Voice recording not found.',
     });
 
     setIsDuress(false);
-    setShowDuressPopup(false);
     setIsUnknown(false);
     setPhase('result');
 
-    speak(`Access Granted. Welcome back, ${assignedRole} ${user.name}`);
-
-    const newLog: LogEntry = {
-      time: getTimeString(),
-      status: 'GRANTED',
-      user: user.name[0] + '. ' + user.name.split(' ').slice(-1)[0],
-    };
-
-    setLogs(prev => [newLog, ...prev].slice(0, 12));
-
-    window.setTimeout(() => {
-      sessionStorage.setItem('biogate_auth', 'true');
-      sessionStorage.setItem('biogate_agent', user.name);
-      sessionStorage.setItem('biogate_role', assignedRole);
-      sessionStorage.setItem('biogate_duress', 'false');
-
-      navigate('/secret-vault', {
-        state: {
-          agentName: user.name,
-          agentRole: assignedRole,
-        },
-      });
-    }, 4000);
-
+    speak('Access Denied. Voice recording not found.');
     return;
   }
+
+  const expectedUser = user.name.toLowerCase().split(' ')[0];
+  setIsVoiceVerifying(true);
+
+  let voiceResult;
+
+  try {
+    voiceResult = await verifyVoiceFromBlob(recordedAudioBlob, expectedUser);
+  } finally {
+    setIsVoiceVerifying(false);
+  }
+
+  console.log("VOICE RESULT:", voiceResult);
+
+  if (!voiceResult.match) {
+    setAuthResult({
+      status: 'error',
+      message: `Voice biometric mismatch. Score: ${voiceResult.score}`,
+    });
+
+    setIsDuress(false);
+    setIsUnknown(false);
+    setPhase('result');
+
+    speak(`Access Denied. Voice biometric mismatch for ${user.name}.`);
+    return;
+  }
+
+  setAuthResult({
+    status: 'success',
+    user: {
+      name: user.name,
+      role: assignedRole,
+    },
+  });
+
+  setIsDuress(false);
+  setShowDuressPopup(false);
+  setIsUnknown(false);
+  setPhase('result');
+
+  speak(`Access Granted. Welcome back, ${assignedRole} ${user.name}`);
+
+  const newLog: LogEntry = {
+    time: getTimeString(),
+    status: 'GRANTED',
+    user: user.name[0] + '. ' + user.name.split(' ').slice(-1)[0],
+  };
+
+  setLogs(prev => [newLog, ...prev].slice(0, 12));
+
+  window.setTimeout(() => {
+    sessionStorage.setItem('biogate_auth', 'true');
+    sessionStorage.setItem('biogate_agent', user.name);
+    sessionStorage.setItem('biogate_role', assignedRole);
+    sessionStorage.setItem('biogate_duress', 'false');
+
+    navigate('/secret-vault', {
+      state: {
+        agentName: user.name,
+        agentRole: assignedRole,
+      },
+    });
+  }, 4000);
+
+  return;
+}
 
   // VOICE SALAH BIASA
   setAuthResult({
@@ -433,6 +553,7 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
     setIsDuress(false);
     setPhraseVisible(false);
     setIsListening(false);
+    setIsVoiceVerifying(false);
   }, 4000);
 }, [navigate]);
 
@@ -450,6 +571,10 @@ const verifyMFA = useCallback(async (spokenPhrase: string) => {
     setAuthResult(null);
     setIsDuress(false);
     setPhraseVisible(false);
+    setIsListening(false);
+    setIsVoiceVerifying(false);
+    setAudioBlob(null);
+    audioBlobRef.current = null;
   }, []);
 
 // ── Real-time Face Scanning via BioGate Face API ─────────────────────────
@@ -574,6 +699,7 @@ const predictWebcam = useCallback(async () => {
         setShowDuressPopup(false);
         setPhraseVisible(false);
         setIsListening(false);
+        setIsVoiceVerifying(false);
         setCameraError(false);
 
         sessionStorage.removeItem("biogate_auth");
@@ -628,16 +754,28 @@ useEffect(() => {
     return () => clearInterval(barIntervalRef.current);
   }, [isListening]);
 
-  const toggleListening = () => {
-    if (isListening) {
-      recognitionRef.current?.stop();
+  const toggleListening = async () => {
+  if (isListening) {
+    recognitionRef.current?.stop();
+    stopVoiceRecording();
+    setIsListening(false);
+    setIsVoiceVerifying(false);
+  } else {
+    setTranscript('');
+    setIsListening(true);
+
+    await startVoiceRecording();
+
+    try {
+      recognitionRef.current?.start();
+    } catch (e) {
+      console.error('Speech recognition start failed:', e);
+      stopVoiceRecording();
       setIsListening(false);
-    } else {
-      setTranscript('');
-      try { recognitionRef.current?.start(); } catch (e) {}
-      setIsListening(true);
+      setIsVoiceVerifying(false);
     }
-  };
+  }
+};
 
   const displayUsers = users.length > 0 ? users : ALL_USERS;
   const isGranted    = phase === 'result' && authResult?.status === 'success';
@@ -1083,6 +1221,12 @@ const StepBadge = ({
                   {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
                   {isListening ? 'Stop Listening' : 'Initialize Voice Scan'}
                 </button>
+                {isVoiceVerifying && (
+                  <div className="mt-4 flex items-center gap-3 border border-yellow-500/50 bg-yellow-500/10 px-4 py-3 font-mono text-xs tracking-widest text-yellow-300">
+                    <span className="h-2 w-2 animate-ping rounded-full bg-yellow-400"></span>
+                    <span>PROCESSING VOICE SIGNATURE...</span>
+                  </div>
+                )}
               </motion.div>
             )}
 
